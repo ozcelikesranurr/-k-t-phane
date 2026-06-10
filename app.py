@@ -1,21 +1,10 @@
 # -*- coding: utf-8 -*-
 
-import os
-# Limit PyTorch / BLAS to 1 thread to save memory on Render Free Tier (512MB RAM)
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
-import gc
 import streamlit as st
 import pandas as pd
 import numpy as np
-import faiss
 import plotly.express as px
 import plotly.graph_objects as go
-from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import PCA
 from dataset import BOOKS_DATASET
@@ -135,52 +124,41 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Synonym dictionary to expand queries for semantic behavior
+SYNONYMS = {
+    "yapay zeka": ["makine öğrenmesi", "otomasyon", "robotik", "bilgisayar bilimleri", "algoritmalar", "akıllı", "derin öğrenme", "sinir ağları"],
+    "makine öğrenmesi": ["yapay zeka", "veri bilimi", "python", "istatistik", "veri analizi", "algoritmalar", "tahmin"],
+    "kütüphane": ["kataloglama", "arşiv", "bilgi yönetimi", "otomasyon", "belge yönetimi", "kitap", "katalog"],
+    "fizik": ["kuantum", "kozmoloji", "uzay-zaman", "kara delikler", "evren", "feynman", "hawking", "schrödinger", "parçacık"],
+    "felsefe": ["etik", "politika", "adalet", "ideal devlet", "nihilizm", "üstinsan", "platon", "nietzsche", "sokratik"],
+    "tarih": ["osmanlı", "dünya tarihi", "yakın tarih", "inalcık", "ortaylı", "medeniyet", "antropoloji", "klasik çağ"],
+    "arşiv": ["belge yönetimi", "dijital arşiv", "konservasyon", "evrak", "dosya", "ts iso"]
+}
+
 # ----------------- SESSION STATE & INITIALIZATION -----------------
 
 # Initialize dataset in session state to allow adding books dynamically
 if "dataset" not in st.session_state:
     st.session_state.dataset = list(BOOKS_DATASET)
 
-# Cache SentenceTransformer model
-@st.cache_resource
-def load_embedding_model():
-    # Load all-MiniLM-L6-v2, which is lightweight (approx 120MB) and very fast
-    return SentenceTransformer('all-MiniLM-L6-v2')
-
-model = load_embedding_model()
-
 # Helper to build indexed text for each book
 def get_book_text(book):
     return f"{book['title']} {book['author']} {book['subjects']} {book['description']}"
 
-# Build indexing data and setup FAISS + TF-IDF
+# Build indexing data and setup TF-IDF + PCA
 @st.cache_data(show_spinner=False)
 def rebuild_indices(dataset_state):
-    # 1. Prepare texts for embedding and TF-IDF
     texts = [get_book_text(b) for b in dataset_state]
     
-    # 2. Dense Embeddings (FAISS)
-    embeddings = model.encode(texts, show_progress_bar=False)
-    embeddings = np.array(embeddings).astype('float32')
-    # L2-normalize embeddings for Cosine Similarity inside Inner Product index
-    faiss.normalize_L2(embeddings)
-    
-    dimension = embeddings.shape[1]
-    faiss_index = faiss.IndexFlatIP(dimension)
-    faiss_index.add(embeddings)
-    
-    # 3. Sparse Embeddings (TF-IDF Vectorizer for Lexical scoring)
+    # Sparse Embeddings (TF-IDF Vectorizer for Lexical scoring)
     vectorizer = TfidfVectorizer(lowercase=True, analyzer='word')
     tfidf_matrix = vectorizer.fit_transform(texts)
     
-    # 4. Dimensionality Reduction (PCA) for 2D visualization
+    # Dimensionality Reduction (PCA) for 2D visualization
     pca = PCA(n_components=2)
-    coords_2d = pca.fit_transform(embeddings)
+    coords_2d = pca.fit_transform(tfidf_matrix.toarray())
     
-    gc.collect()
     return {
-        "embeddings": embeddings,
-        "faiss_index": faiss_index,
         "vectorizer": vectorizer,
         "tfidf_matrix": tfidf_matrix,
         "coords_2d": coords_2d,
@@ -189,7 +167,6 @@ def rebuild_indices(dataset_state):
 
 # Compute indices based on current state of dataset
 indices = rebuild_indices(st.session_state.dataset)
-gc.collect()
 
 # ----------------- SEARCH ALGORITHMS -----------------
 
@@ -206,8 +183,6 @@ def boolean_search(query, dataset):
         
         # Simulating standard boolean parser
         # Supports: AND, OR, NOT (case-insensitive)
-        
-        # 1. Parse OR first (highest level split)
         if " or " in query:
             parts = query.split(" or ")
             is_match = any(boolean_match_segment(text, part) for part in parts)
@@ -241,55 +216,67 @@ def boolean_match_segment(text, segment):
     return all(w in text for w in words)
 
 
-# 2. Semantic Search (Dense Retrieval)
+# Query expansion helper for Semantic Search
+def expand_query(query):
+    query_lower = query.lower()
+    expanded_terms = [query_lower]
+    for key, syns in SYNONYMS.items():
+        if key in query_lower:
+            expanded_terms.extend(syns)
+    return " ".join(expanded_terms)
+
+
+# 2. Simulated Semantic Search (TF-IDF with Synonym Expansion)
 def semantic_search(query, dataset, indices, k=5):
-    query_vector = model.encode([query]).astype('float32')
-    faiss.normalize_L2(query_vector)
+    if not query.strip():
+        return []
+        
+    # Expand query with related concepts
+    expanded_q = expand_query(query)
     
-    # Search the FAISS Index
-    # FlatIP index returns cosine similarities as distances (higher is better, max 1.0)
-    scores, idxs = indices["faiss_index"].search(query_vector, k)
+    # Vectorize the expanded query
+    query_vector = indices["vectorizer"].transform([expanded_q])
+    
+    # Cosine similarity between query vector and database TF-IDF matrix
+    scores = (indices["tfidf_matrix"] * query_vector.T).toarray().flatten()
     
     results = []
-    for score, idx in zip(scores[0], idxs[0]):
-        if idx != -1 and idx < len(dataset):
-            book = dataset[idx].copy()
-            book["score"] = float(score)
-            results.append(book)
-    return results
+    for idx, score in enumerate(scores):
+        book = dataset[idx].copy()
+        # Scale score to look like similarity [0, 1]
+        book["score"] = float(score)
+        results.append(book)
+        
+    # Sort by score descending
+    results = sorted(results, key=lambda x: x["score"], reverse=True)
+    return results[:k]
 
 
 # 3. Hybrid Search Engine (Lexical + Semantic)
 def hybrid_search(query, dataset, indices, alpha=0.5, k=5):
-    # Get Semantic Scores
-    query_vector = model.encode([query]).astype('float32')
-    faiss.normalize_L2(query_vector)
-    sem_scores, _ = indices["faiss_index"].search(query_vector, len(dataset))
-    
-    # Mapping indices back to ensure alignment
-    semantic_scores_map = {i: score for i, score in enumerate(sem_scores[0])}
-    
-    # Get Lexical (TF-IDF) Scores
+    if not query.strip():
+        return []
+        
+    # Get Lexical (TF-IDF) Scores (original query)
     tfidf_vector = indices["vectorizer"].transform([query])
-    # Cosine similarity between query tfidf and dataset tfidf matrix
     lex_scores = (indices["tfidf_matrix"] * tfidf_vector.T).toarray().flatten()
-    lexical_scores_map = {i: score for i, score in enumerate(lex_scores)}
+    
+    # Get Semantic Scores (expanded query)
+    expanded_q = expand_query(query)
+    sem_vector = indices["vectorizer"].transform([expanded_q])
+    sem_scores = (indices["tfidf_matrix"] * sem_vector.T).toarray().flatten()
     
     # Combine Scores
     combined_results = []
     for i, book in enumerate(dataset):
-        sem_score = semantic_scores_map.get(i, 0.0)
-        lex_score = lexical_scores_map.get(i, 0.0)
+        lex_score = float(lex_scores[i])
+        sem_score = float(sem_scores[i])
         
-        # Min-Max Scaling or Direct combination since both are cosine similarities [0, 1]
-        # Soften semantic scores to standard [0, 1] range
-        sem_score_norm = max(0.0, min(1.0, (sem_score + 1) / 2)) 
-        
-        hybrid_score = (alpha * sem_score_norm) + ((1.0 - alpha) * lex_score)
+        hybrid_score = (alpha * sem_score) + ((1.0 - alpha) * lex_score)
         
         book_copy = book.copy()
-        book_copy["semantic_score"] = float(sem_score_norm)
-        book_copy["lexical_score"] = float(lex_score)
+        book_copy["semantic_score"] = sem_score
+        book_copy["lexical_score"] = lex_score
         book_copy["score"] = float(hybrid_score)
         combined_results.append(book_copy)
         
@@ -314,7 +301,7 @@ with st.sidebar:
         new_isbn = st.text_input("ISBN (Örn: 978-975-...)")
         new_year = st.number_input("Yayın Yılı", min_value=-2000, max_value=2026, value=2024)
         
-        submitted = st.form_submit_form_button = st.form_submit_button("Kataloğa Ekle & İndeksle")
+        submitted = st.form_submit_button("Kataloğa Ekle & İndeksle")
         
         if submitted:
             if new_title and new_author and new_desc:
@@ -330,7 +317,7 @@ with st.sidebar:
                 # Update dataset and clear cache of index rebuild
                 st.session_state.dataset.append(new_book)
                 st.cache_data.clear()
-                st.success(f"'{new_title}' başarıyla eklendi ve FAISS vektör indeksine dahil edildi!")
+                st.success(f"'{new_title}' başarıyla eklendi ve vektör indeksine dahil edildi!")
                 st.rerun()
             else:
                 st.error("Lütfen Kitap Adı, Yazar ve Açıklama alanlarını doldurun.")
@@ -411,7 +398,7 @@ with tab_search:
         # 2. Column: Semantic Search
         with col_sem:
             st.markdown('### 🟩 Semantik Vektör Arama <span class="badge-semantic">Modern</span>', unsafe_allow_html=True)
-            st.caption("**Model:** `all-MiniLM-L6-v2` + FAISS Cosine Similarity")
+            st.caption("**Model:** Vektör Uzayı Modeli + Genişletilmiş Sorgu Analizi")
             
             for book in semantic_results:
                 st.markdown(f"""
@@ -448,17 +435,16 @@ with tab_search:
 with tab_visualization:
     st.markdown("### 🗺️ Vektör Embedding Uzayı")
     st.write(
-        "Aşağıdaki grafik, kütüphanedeki kitapların 384 boyutlu anlamsal vektörlerinin PCA ile 2 boyuta düşürülmüş halidir. "
+        "Aşağıdaki grafik, kütüphanedeki kitapların anlamsal vektörlerinin PCA ile 2 boyuta düşürülmüş halidir. "
         "Yakın noktalar, anlamsal olarak birbirine benzeyen kitapları temsil eder."
     )
     
     if search_query:
-        # Get query coordinate
-        query_vector = model.encode([search_query]).astype('float32')
-        faiss.normalize_L2(query_vector)
+        # Vectorize original query
+        query_vec = indices["vectorizer"].transform([search_query]).toarray()
         
         # Project using the same PCA
-        query_2d = indices["pca"].transform(query_vector)[0]
+        query_2d = indices["pca"].transform(query_vec)[0]
         
         # Create Dataframe for plotting
         plot_data = []
