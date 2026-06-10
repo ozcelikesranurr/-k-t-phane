@@ -1,5 +1,14 @@
 # -*- coding: utf-8 -*-
 
+import os
+# Limit PyTorch / BLAS to 1 thread to save memory on Render Free Tier (512MB RAM)
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+import gc
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -168,6 +177,7 @@ def rebuild_indices(dataset_state):
     pca = PCA(n_components=2)
     coords_2d = pca.fit_transform(embeddings)
     
+    gc.collect()
     return {
         "embeddings": embeddings,
         "faiss_index": faiss_index,
@@ -179,6 +189,7 @@ def rebuild_indices(dataset_state):
 
 # Compute indices based on current state of dataset
 indices = rebuild_indices(st.session_state.dataset)
+gc.collect()
 
 # ----------------- SEARCH ALGORITHMS -----------------
 
